@@ -6,12 +6,18 @@ This is the original baseline kept side-by-side with the advanced ensemble
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.preprocessing import StandardScaler
+
+from predict import DataFetchError, InsufficientDataError, TickerNotFoundError
+
+logger = logging.getLogger(__name__)
 
 
 FEATURES = [
@@ -24,9 +30,18 @@ FEATURES = [
 
 
 def fetch_history(ticker: str, period: str = "5y") -> pd.DataFrame:
-    df = yf.download(ticker, period=period, progress=False, auto_adjust=True)
-    if df.empty:
-        raise ValueError(f"No data returned for ticker '{ticker}'.")
+    logger.info("Fetching history for %s (period=%s)", ticker, period)
+    try:
+        df = yf.download(ticker, period=period, progress=False, auto_adjust=True)
+    except Exception as e:
+        logger.exception("yfinance download failed for %s", ticker)
+        raise DataFetchError(
+            f"Could not reach the data provider for '{ticker}': {e}."
+        ) from e
+    if df is None or df.empty:
+        raise TickerNotFoundError(
+            f"No data returned for '{ticker}'. The ticker may be delisted or incorrect."
+        )
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     df.columns = [str(c).lower() for c in df.columns]
@@ -74,7 +89,10 @@ def train_and_predict(ticker: str, period: str = "5y", **_) -> dict:
     df = add_features(raw)
 
     if len(df) < 100:
-        raise ValueError(f"Not enough history for '{ticker}' ({len(df)} usable rows).")
+        raise InsufficientDataError(
+            f"Only {len(df)} usable rows for '{ticker}' (need >= 100). "
+            "Try a longer history window."
+        )
 
     X = df[FEATURES].values
     y = df["target_return"].values

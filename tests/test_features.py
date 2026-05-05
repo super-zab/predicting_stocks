@@ -91,6 +91,33 @@ def test_walk_forward_backtest_stitches_folds(monkeypatch):
     assert len(result["test_dates"]) == len(result["pred_prices"]) == len(result["actual_prices"])
 
 
+def test_typed_errors_for_unknown_ticker(monkeypatch):
+    """fetch_history must raise TickerNotFoundError on empty downloads,
+    DataFetchError on transport exceptions, and InsufficientDataError when
+    train_and_predict has too little data."""
+    import predict
+    from predict import (
+        DataFetchError, InsufficientDataError, TickerNotFoundError,
+    )
+
+    monkeypatch.setattr(predict.yf, "download",
+                        lambda *a, **kw: pd.DataFrame())
+    with pytest.raises(TickerNotFoundError):
+        predict.fetch_history("ZZZZ")
+
+    def _raise(*a, **kw):
+        raise ConnectionError("DNS failure")
+    monkeypatch.setattr(predict.yf, "download", _raise)
+    with pytest.raises(DataFetchError):
+        predict.fetch_history("AAPL")
+
+    monkeypatch.setattr(predict, "fetch_history",
+                        lambda t, period="5y": _synthetic_ohlcv(50))
+    monkeypatch.setattr(predict, "fetch_macro", lambda period="5y": None)
+    with pytest.raises(InsufficientDataError):
+        predict.train_and_predict("FAKE", period="6mo")
+
+
 def test_backtest_metrics_shape_and_costs():
     """Backtest helper should produce all enriched metrics, and total return must
     decrease monotonically with rising transaction costs."""

@@ -9,12 +9,31 @@ Pipeline:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Callable, Iterable
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
+
+logger = logging.getLogger(__name__)
+
+
+class PredictionError(Exception):
+    """Base class for predict.py errors that should be shown to the user."""
+
+
+class TickerNotFoundError(PredictionError):
+    """yfinance returned no rows for the requested ticker."""
+
+
+class InsufficientDataError(PredictionError):
+    """The ticker exists but has too few usable rows after feature engineering."""
+
+
+class DataFetchError(PredictionError):
+    """Network or parsing error while fetching market data."""
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.metrics import (
     accuracy_score,
@@ -56,10 +75,25 @@ def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def fetch_history(ticker: str, period: str = "5y") -> pd.DataFrame:
-    df = yf.download(ticker, period=period, progress=False, auto_adjust=True)
-    if df.empty:
-        raise ValueError(f"No data returned for ticker '{ticker}'.")
+    logger.info("Fetching history for %s (period=%s)", ticker, period)
+    try:
+        df = yf.download(ticker, period=period, progress=False, auto_adjust=True)
+    except Exception as e:
+        logger.exception("yfinance download failed for %s", ticker)
+        raise DataFetchError(
+            f"Could not reach the data provider for '{ticker}': {e}. "
+            "Check your network and try again."
+        ) from e
+    if df is None or df.empty:
+        raise TickerNotFoundError(
+            f"No data returned for '{ticker}'. The ticker may be delisted, "
+            "incorrect, or unsupported by Yahoo Finance. "
+            "Check the symbol (e.g. BTC-USD for crypto, EURUSD=X for FX, MC.PA for Paris)."
+        )
     df = _flatten_columns(df)
+    missing = [c for c in ("open", "high", "low", "close", "volume") if c not in df.columns]
+    if missing:
+        raise DataFetchError(f"Provider returned an unexpected schema (missing {missing}).")
     return df[["open", "high", "low", "close", "volume"]]
 
 
@@ -211,7 +245,10 @@ def walk_forward_backtest(
     macro = fetch_macro(period=period) if use_macro else None
     df = add_features(raw, macro=macro)
     if len(df) < 250:
-        raise ValueError(f"Not enough history for walk-forward on '{ticker}' ({len(df)} rows).")
+        raise InsufficientDataError(
+            f"Only {len(df)} usable rows for walk-forward on '{ticker}' (need >= 250). "
+            "Try a longer history window."
+        )
 
     feat_cols = feature_columns(df)
     X = df[feat_cols].values
@@ -223,7 +260,10 @@ def walk_forward_backtest(
 
     folds = list(walk_forward_indices(len(df), n_folds=n_folds, min_train=min_train))
     if not folds:
-        raise ValueError("Not enough rows to build any walk-forward folds.")
+        raise InsufficientDataError(
+            "Not enough rows to build any walk-forward folds. "
+            "Try a longer history window or fewer folds."
+        )
 
     pred_returns_all: list[np.ndarray] = []
     test_indices_all: list[np.ndarray] = []
@@ -352,7 +392,10 @@ def train_and_predict(
     df = add_features(raw, macro=macro)
 
     if len(df) < 150:
-        raise ValueError(f"Not enough history for '{ticker}' ({len(df)} usable rows).")
+        raise InsufficientDataError(
+            f"Only {len(df)} usable rows for '{ticker}' after feature engineering "
+            "(need >= 150). Try a longer history window or a more liquid ticker."
+        )
 
     feat_cols = feature_columns(df)
     X = df[feat_cols].values

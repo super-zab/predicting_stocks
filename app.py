@@ -10,6 +10,7 @@ Tabs: Predict, Backtest, Compare.
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 
 import numpy as np
@@ -19,12 +20,25 @@ import streamlit as st
 
 import predict as predict_advanced
 import predict_classic
+from predict import (
+    DataFetchError,
+    InsufficientDataError,
+    PredictionError,
+    TickerNotFoundError,
+)
 
 try:
     import joblib
     HAS_JOBLIB = True
 except ImportError:
     HAS_JOBLIB = False
+
+
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 
 CACHE_DIR = os.path.join(os.path.dirname(__file__), ".prediction_cache")
@@ -88,28 +102,57 @@ def _cache_key(engine_label: str, ticker: str, period: str, horizon: int, use_ma
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 30)
-def cached_predict(engine_label: str, ticker: str, period: str, horizon: int, use_macro: bool):
-    """Streamlit memory cache + joblib disk cache (if available)."""
+def cached_predict(engine_label: str, ticker: str, period: str, horizon: int,
+                   use_macro: bool, force_refresh: bool = False):
+    """Streamlit memory cache + joblib disk cache (if available).
+
+    `force_refresh=True` skips both caches for this call. Streamlit's @cache_data
+    keys on all positional args, so flipping force_refresh between True/False
+    creates two distinct cache entries — exactly what we want.
+    """
     key = _cache_key(engine_label, ticker, period, horizon, use_macro)
     disk_path = os.path.join(CACHE_DIR, f"{key}.joblib")
-    if HAS_JOBLIB and os.path.exists(disk_path):
+    if not force_refresh and HAS_JOBLIB and os.path.exists(disk_path):
         try:
+            logger.info("Cache hit for %s (%s)", ticker, engine_label)
             return joblib.load(disk_path)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Disk cache read failed (%s); recomputing", e)
 
+    logger.info("Training %s on %s (period=%s, horizon=%s, macro=%s, refresh=%s)",
+                engine_label, ticker, period, horizon, use_macro, force_refresh)
     engine = ENGINES[engine_label]
     if engine is predict_advanced:
-        result = engine.train_and_predict(ticker, period=period, horizon=horizon, use_macro=use_macro)
+        result = engine.train_and_predict(ticker, period=period,
+                                          horizon=horizon, use_macro=use_macro)
     else:
         result = engine.train_and_predict(ticker, period=period)
 
     if HAS_JOBLIB:
         try:
             joblib.dump(result, disk_path)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Disk cache write failed (%s)", e)
     return result
+
+
+def show_prediction_error(ticker: str, exc: Exception) -> None:
+    """Render a user-friendly message for a known prediction failure."""
+    if isinstance(exc, TickerNotFoundError):
+        st.error(f":mag: Ticker not found")
+        st.info(str(exc))
+    elif isinstance(exc, InsufficientDataError):
+        st.warning(f":hourglass: Not enough history")
+        st.info(str(exc))
+    elif isinstance(exc, DataFetchError):
+        st.error(f":satellite: Data provider error")
+        st.info(str(exc))
+        st.caption("If the issue persists, retry in a few seconds — yfinance can rate-limit.")
+    elif isinstance(exc, PredictionError):
+        st.error(str(exc))
+    else:
+        logger.exception("Unexpected prediction failure for %s", ticker)
+        st.error(f"Unexpected error for '{ticker}': {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -344,6 +387,12 @@ with st.sidebar:
     use_macro = st.checkbox("Include macro features (VIX, S&P, 10Y)", value=True,
                             disabled=engine_label.startswith("Classique"))
     chart_mode = st.radio("Chart style", ["Line + animation", "Candlestick"], index=0)
+    force_refresh = st.checkbox(
+        "Refresh data on next run",
+        value=False,
+        help="Bypass both the memory and disk caches for the next prediction. "
+             "Use this when intraday or end-of-day data has just updated.",
+    )
 
     if HAS_JOBLIB and st.button("Clear disk cache", use_container_width=True):
         for f in os.listdir(CACHE_DIR):
@@ -380,9 +429,10 @@ with tab_predict:
             st.stop()
         with st.spinner(f"[{engine_label}] Training on {ticker}..."):
             try:
-                result = cached_predict(engine_label, ticker, period, horizon, use_macro)
+                result = cached_predict(engine_label, ticker, period, horizon,
+                                        use_macro, force_refresh=force_refresh)
             except Exception as e:
-                st.error(f"Could not predict for '{ticker}': {e}")
+                show_prediction_error(ticker, e)
                 st.stop()
         st.session_state["last_result"] = result
         st.session_state["last_engine"] = engine_label
@@ -559,7 +609,8 @@ with tab_compare:
             progress = st.progress(0.0)
             for i, t in enumerate(cmp_tickers):
                 try:
-                    r = cached_predict(engine_label, t, period, horizon, use_macro)
+                    r = cached_predict(engine_label, t, period, horizon, use_macro,
+                                       force_refresh=force_refresh)
                     rows.append({
                         "Ticker": r["ticker"],
                         "Last close": r["last_close"],
@@ -619,11 +670,13 @@ with tab_compare:
             try:
                 with st.spinner(f"Running both engines on {h2h_ticker}..."):
                     classic_r = cached_predict("Classique (Random Forest seul)",
-                                               h2h_ticker, period, 1, False)
+                                               h2h_ticker, period, 1, False,
+                                               force_refresh=force_refresh)
                     advanced_r = cached_predict("Avance (Ensemble + macro + classifier)",
-                                                h2h_ticker, period, horizon, use_macro)
+                                                h2h_ticker, period, horizon, use_macro,
+                                                force_refresh=force_refresh)
             except Exception as e:
-                st.error(f"Head-to-head failed: {e}")
+                show_prediction_error(h2h_ticker, e)
                 st.stop()
 
             fig = go.Figure()
