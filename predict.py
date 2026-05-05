@@ -194,6 +194,107 @@ def available_regressors() -> list[ModelSpec]:
 # Validation
 # ---------------------------------------------------------------------------
 
+def walk_forward_backtest(
+    ticker: str,
+    period: str = "5y",
+    n_folds: int = 5,
+    use_macro: bool = True,
+) -> dict:
+    """Refit the ensemble on rolling expanding folds and stitch the OOS predictions.
+
+    Unlike `train_and_predict` which trains once on the train tail, this walks
+    forward through the entire test window, retraining at every fold boundary.
+    Returns a dict shaped like a `train_and_predict` result so it can flow
+    straight into the existing backtest helpers.
+    """
+    raw = fetch_history(ticker, period=period)
+    macro = fetch_macro(period=period) if use_macro else None
+    df = add_features(raw, macro=macro)
+    if len(df) < 250:
+        raise ValueError(f"Not enough history for walk-forward on '{ticker}' ({len(df)} rows).")
+
+    feat_cols = feature_columns(df)
+    X = df[feat_cols].values
+    y_return = df["target_return"].values
+    close = df["close"].values
+
+    min_train = max(200, int(len(df) * 0.5))
+    specs = available_regressors()
+
+    folds = list(walk_forward_indices(len(df), n_folds=n_folds, min_train=min_train))
+    if not folds:
+        raise ValueError("Not enough rows to build any walk-forward folds.")
+
+    pred_returns_all: list[np.ndarray] = []
+    test_indices_all: list[np.ndarray] = []
+    residuals: list[np.ndarray] = []
+
+    for tr_idx, te_idx in folds:
+        Xt_raw, Xe_raw = X[tr_idx], X[te_idx]
+        sc = StandardScaler().fit(Xt_raw)
+        Xt_s, Xe_s = sc.transform(Xt_raw), sc.transform(Xe_raw)
+
+        fold_preds = []
+        for spec in specs:
+            m = spec.build()
+            m.fit(Xt_s if spec.needs_scaling else Xt_raw, y_return[tr_idx])
+            fold_preds.append(m.predict(Xe_s if spec.needs_scaling else Xe_raw))
+        fold_preds.append(np.zeros(len(te_idx)))  # naive baseline
+        ensemble = np.mean(fold_preds, axis=0)
+
+        pred_returns_all.append(ensemble)
+        test_indices_all.append(te_idx)
+        residuals.append(y_return[te_idx] - ensemble)
+
+    test_idx = np.concatenate(test_indices_all)
+    pred_returns = np.concatenate(pred_returns_all)
+    actual_returns = y_return[test_idx]
+    closes_t = close[test_idx]
+    pred_prices = closes_t * (1 + pred_returns)
+    actual_prices = closes_t * (1 + actual_returns)
+
+    halfwidth = _conformal_halfwidth(np.concatenate(residuals), alpha=0.05)
+    lower_prices = closes_t * (1 + pred_returns - halfwidth)
+    upper_prices = closes_t * (1 + pred_returns + halfwidth)
+
+    mae = float(mean_absolute_error(actual_prices, pred_prices))
+    rmse = float(np.sqrt(mean_squared_error(actual_prices, pred_prices)))
+    r2 = float(r2_score(actual_prices, pred_prices))
+    direction_acc = float(((pred_returns > 0) == (actual_returns > 0)).mean())
+
+    return {
+        "ticker": ticker.upper(),
+        "history": raw,
+        "feature_columns": feat_cols,
+        "test_dates": df.index[test_idx],
+        "actual_prices": actual_prices,
+        "pred_prices": pred_prices,
+        "lower_prices": lower_prices,
+        "upper_prices": upper_prices,
+        "metrics": {
+            "mae": mae, "rmse": rmse, "r2": r2,
+            "direction_accuracy": direction_acc,
+            "ci_halfwidth_return": halfwidth,
+            "n_folds": len(folds),
+            "models": [s.name for s in specs] + ["naive_zero"],
+            "mode": "walk_forward",
+        },
+        "last_close": float(df["close"].iloc[-1]),
+        "last_date": df.index[-1],
+        "next_date": df.index[-1],
+        "next_price": float(df["close"].iloc[-1]),
+        "next_lower": float(df["close"].iloc[-1]),
+        "next_upper": float(df["close"].iloc[-1]),
+        "next_proba_up": 0.5,
+        "forecast_dates": [],
+        "forecast_prices": [],
+        "forecast_lower": [],
+        "forecast_upper": [],
+        "per_model_test_returns": {},
+        "feature_importance": {},
+    }
+
+
 def walk_forward_indices(n: int, n_folds: int = 5, min_train: int = 200) -> Iterable[tuple[np.ndarray, np.ndarray]]:
     """Expanding-window walk-forward folds over the tail of the series."""
     fold_size = max(20, (n - min_train) // n_folds)

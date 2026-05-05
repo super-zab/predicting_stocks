@@ -474,12 +474,40 @@ with tab_backtest:
     if not result:
         st.info("Run a prediction first to see the backtest.")
     else:
-        cost_bps = st.slider(
-            "Transaction cost (basis points per side)",
-            min_value=0, max_value=50, value=5, step=1,
-            help="Charged on every position change. 5 bps ~ 0.05% per entry/exit.",
-        )
-        bt = backtest_signal(result, cost_bps=float(cost_bps))
+        bt_col1, bt_col2 = st.columns([2, 1])
+        with bt_col1:
+            cost_bps = st.slider(
+                "Transaction cost (basis points per side)",
+                min_value=0, max_value=50, value=5, step=1,
+                help="Charged on every position change. 5 bps ~ 0.05% per entry/exit.",
+            )
+        with bt_col2:
+            bt_mode = st.radio(
+                "Backtest mode",
+                ["Single split", "Walk-forward refit"],
+                index=0, horizontal=False,
+                help="Walk-forward retrains the model at each fold boundary across the "
+                     "whole test window — more realistic than a single train/test split. "
+                     "Advanced engine only; Classique falls back to single split.",
+            )
+
+        if bt_mode == "Walk-forward refit":
+            try:
+                with st.spinner("Walk-forward refit..."):
+                    wf_result = predict_advanced.walk_forward_backtest(
+                        result["ticker"], period=period, n_folds=5, use_macro=use_macro,
+                    )
+                bt = backtest_signal(wf_result, cost_bps=float(cost_bps))
+                st.caption(
+                    f"Walk-forward over {wf_result['metrics']['n_folds']} folds, "
+                    f"{len(wf_result['test_dates'])} OOS days. "
+                    f"Direction acc {wf_result['metrics']['direction_accuracy']*100:.1f}%."
+                )
+            except Exception as e:
+                st.error(f"Walk-forward failed: {e}. Falling back to single split.")
+                bt = backtest_signal(result, cost_bps=float(cost_bps))
+        else:
+            bt = backtest_signal(result, cost_bps=float(cost_bps))
 
         r1c1, r1c2, r1c3, r1c4 = st.columns(4)
         r1c1.metric("Strategy return", f"{bt['strategy_total_return']*100:+.2f}%",
@@ -509,63 +537,129 @@ with tab_backtest:
 # Compare tab
 # ---------------------------------------------------------------------------
 with tab_compare:
-    st.markdown("Pick a few tickers to compare next-day forecasts side by side.")
-    cmp_group = st.selectbox("Asset class", list(PRESET_GROUPS.keys()), index=0, key="cmp_group")
-    cmp_tickers = st.multiselect(
-        "Tickers", PRESET_GROUPS[cmp_group],
-        default=PRESET_GROUPS[cmp_group][:3],
-        key="cmp_tickers_select",
+    cmp_mode = st.radio(
+        "Mode",
+        ["Ranking (multi-ticker)", "Head-to-head (Classique vs Avance, single ticker)"],
+        index=0, horizontal=True, key="cmp_mode",
     )
-    cmp_run = st.button("Compare", key="cmp_btn")
-    if cmp_run and cmp_tickers:
-        rows = []
-        progress = st.progress(0.0)
-        for i, t in enumerate(cmp_tickers):
-            try:
-                r = cached_predict(engine_label, t, period, horizon, use_macro)
-                rows.append({
-                    "Ticker": r["ticker"],
-                    "Last close": r["last_close"],
-                    "Next predicted": r["next_price"],
-                    "Change %": (r["next_price"] - r["last_close"]) / r["last_close"] * 100,
-                    "P(up)": r.get("next_proba_up", 0.5) * 100,
-                    "MAE": r["metrics"]["mae"],
-                    "Dir acc": r["metrics"].get("direction_accuracy", 0) * 100,
-                })
-            except Exception as e:
-                rows.append({"Ticker": t.upper(), "Last close": None, "Next predicted": None,
-                             "Change %": None, "P(up)": None, "MAE": None, "Dir acc": None,
-                             "error": str(e)})
-            progress.progress((i + 1) / len(cmp_tickers))
-        progress.empty()
 
-        df_cmp = pd.DataFrame(rows)
-
-        def _style(v):
-            if isinstance(v, (int, float)) and not pd.isna(v):
-                return f"color: {'#2ecc71' if v >= 0 else '#ff5a5f'}; font-weight:600;"
-            return ""
-
-        st.dataframe(
-            df_cmp.style.applymap(_style, subset=["Change %"]).format({
-                "Last close": "${:,.2f}", "Next predicted": "${:,.2f}",
-                "Change %": "{:+.2f}%", "P(up)": "{:.0f}%",
-                "MAE": "${:.2f}", "Dir acc": "{:.1f}%",
-            }),
-            use_container_width=True,
+    if cmp_mode.startswith("Ranking"):
+        st.markdown("Pick a few tickers to compare next-day forecasts side by side.")
+        cmp_group = st.selectbox("Asset class", list(PRESET_GROUPS.keys()),
+                                 index=0, key="cmp_group")
+        cmp_tickers = st.multiselect(
+            "Tickers", PRESET_GROUPS[cmp_group],
+            default=PRESET_GROUPS[cmp_group][:3],
+            key="cmp_tickers_select",
         )
+        cmp_run = st.button("Compare", key="cmp_btn")
 
-        # Bar chart of expected % moves
-        plot_df = df_cmp.dropna(subset=["Change %"])
-        if not plot_df.empty:
-            fig = go.Figure(go.Bar(
-                x=plot_df["Ticker"], y=plot_df["Change %"],
-                marker_color=["#2ecc71" if v >= 0 else "#ff5a5f" for v in plot_df["Change %"]],
-                hovertemplate="%{x}: %{y:+.2f}%<extra></extra>",
+        if cmp_run and cmp_tickers:
+            rows = []
+            progress = st.progress(0.0)
+            for i, t in enumerate(cmp_tickers):
+                try:
+                    r = cached_predict(engine_label, t, period, horizon, use_macro)
+                    rows.append({
+                        "Ticker": r["ticker"],
+                        "Last close": r["last_close"],
+                        "Next predicted": r["next_price"],
+                        "Change %": (r["next_price"] - r["last_close"]) / r["last_close"] * 100,
+                        "P(up)": r.get("next_proba_up", 0.5) * 100,
+                        "MAE": r["metrics"]["mae"],
+                        "Dir acc": r["metrics"].get("direction_accuracy", 0) * 100,
+                    })
+                except Exception as e:
+                    rows.append({"Ticker": t.upper(), "Last close": None,
+                                 "Next predicted": None, "Change %": None,
+                                 "P(up)": None, "MAE": None, "Dir acc": None,
+                                 "error": str(e)})
+                progress.progress((i + 1) / len(cmp_tickers))
+            progress.empty()
+
+            df_cmp = pd.DataFrame(rows)
+
+            def _style(v):
+                if isinstance(v, (int, float)) and not pd.isna(v):
+                    return f"color: {'#2ecc71' if v >= 0 else '#ff5a5f'}; font-weight:600;"
+                return ""
+
+            st.dataframe(
+                df_cmp.style.applymap(_style, subset=["Change %"]).format({
+                    "Last close": "${:,.2f}", "Next predicted": "${:,.2f}",
+                    "Change %": "{:+.2f}%", "P(up)": "{:.0f}%",
+                    "MAE": "${:.2f}", "Dir acc": "{:.1f}%",
+                }),
+                use_container_width=True,
+            )
+
+            plot_df = df_cmp.dropna(subset=["Change %"])
+            if not plot_df.empty:
+                fig = go.Figure(go.Bar(
+                    x=plot_df["Ticker"], y=plot_df["Change %"],
+                    marker_color=["#2ecc71" if v >= 0 else "#ff5a5f"
+                                  for v in plot_df["Change %"]],
+                    hovertemplate="%{x}: %{y:+.2f}%<extra></extra>",
+                ))
+                fig.update_layout(
+                    template="plotly_dark", plot_bgcolor="#0b0d12", paper_bgcolor="#0b0d12",
+                    height=360, margin=dict(l=20, r=20, t=20, b=20),
+                    yaxis=dict(title="Predicted next-day move (%)", gridcolor="#1a1f2a"),
+                )
+                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+    else:
+        st.markdown("Run both engines on the same ticker and overlay their predictions.")
+        h2h_group = st.selectbox("Asset class", list(PRESET_GROUPS.keys()),
+                                 index=0, key="h2h_group")
+        h2h_ticker = st.selectbox("Ticker", PRESET_GROUPS[h2h_group], key="h2h_ticker")
+        h2h_run = st.button("Run head-to-head", key="h2h_btn")
+
+        if h2h_run and h2h_ticker:
+            try:
+                with st.spinner(f"Running both engines on {h2h_ticker}..."):
+                    classic_r = cached_predict("Classique (Random Forest seul)",
+                                               h2h_ticker, period, 1, False)
+                    advanced_r = cached_predict("Avance (Ensemble + macro + classifier)",
+                                                h2h_ticker, period, horizon, use_macro)
+            except Exception as e:
+                st.error(f"Head-to-head failed: {e}")
+                st.stop()
+
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=list(classic_r["test_dates"]), y=list(classic_r["actual_prices"]),
+                name="Actual", line=dict(color="#9aa0a6", width=2),
+                hovertemplate="%{x|%b %d, %Y}<br>$%{y:.2f}<extra></extra>",
+            ))
+            fig.add_trace(go.Scatter(
+                x=list(classic_r["test_dates"]), y=list(classic_r["pred_prices"]),
+                name="Classique", line=dict(color="#3b82f6", width=2.5),
+                hovertemplate="Classique<br>%{x|%b %d}<br>$%{y:.2f}<extra></extra>",
+            ))
+            fig.add_trace(go.Scatter(
+                x=list(advanced_r["test_dates"]), y=list(advanced_r["pred_prices"]),
+                name="Avance", line=dict(color="#2ecc71", width=2.5),
+                hovertemplate="Avance<br>%{x|%b %d}<br>$%{y:.2f}<extra></extra>",
             ))
             fig.update_layout(
                 template="plotly_dark", plot_bgcolor="#0b0d12", paper_bgcolor="#0b0d12",
-                height=360, margin=dict(l=20, r=20, t=20, b=20),
-                yaxis=dict(title="Predicted next-day move (%)", gridcolor="#1a1f2a"),
+                height=480, margin=dict(l=20, r=20, t=20, b=20),
+                xaxis=dict(showgrid=False, color="#8b93a1"),
+                yaxis=dict(title="Price (USD)", gridcolor="#1a1f2a", color="#8b93a1"),
+                legend=dict(orientation="h", y=1.05, x=0, bgcolor="rgba(0,0,0,0)"),
             )
             st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+            mc = classic_r["metrics"]
+            ma = advanced_r["metrics"]
+            cmp_df = pd.DataFrame({
+                "Classique": [mc["mae"], mc["rmse"], mc["r2"],
+                              mc.get("direction_accuracy", 0) * 100,
+                              classic_r["next_price"]],
+                "Avance":    [ma["mae"], ma["rmse"], ma["r2"],
+                              ma.get("direction_accuracy", 0) * 100,
+                              advanced_r["next_price"]],
+            }, index=["MAE ($)", "RMSE ($)", "R^2",
+                      "Direction acc (%)", "Next predicted ($)"])
+            st.dataframe(cmp_df.style.format("{:.3f}"), use_container_width=True)

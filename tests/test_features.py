@@ -80,5 +80,41 @@ def test_classic_train_and_predict_end_to_end(monkeypatch):
     assert "mae" in result["metrics"]
 
 
+def test_walk_forward_backtest_stitches_folds(monkeypatch):
+    import predict
+    monkeypatch.setattr(predict, "fetch_history", lambda t, period="5y": _synthetic_ohlcv(800))
+    monkeypatch.setattr(predict, "fetch_macro", lambda period="5y": None)
+    result = predict.walk_forward_backtest("FAKE", period="3y", n_folds=4)
+    assert result["metrics"]["mode"] == "walk_forward"
+    assert result["metrics"]["n_folds"] >= 1
+    assert len(result["test_dates"]) > 0
+    assert len(result["test_dates"]) == len(result["pred_prices"]) == len(result["actual_prices"])
+
+
+def test_backtest_metrics_shape_and_costs():
+    """Backtest helper should produce all enriched metrics, and total return must
+    decrease monotonically with rising transaction costs."""
+    import app
+    import predict
+    df = _synthetic_ohlcv(500)
+
+    # Build a minimal result-like dict that backtest_signal accepts.
+    test_dates = df.index[-50:]
+    actual = df["close"].reindex(test_dates).values * 1.001  # tiny synthetic move
+    pred = actual * 1.0005  # half the move predicted = some signal
+    result = {
+        "history": df,
+        "test_dates": test_dates,
+        "actual_prices": actual,
+        "pred_prices": pred,
+    }
+    keys = {"sharpe", "max_drawdown", "buy_hold_max_drawdown",
+            "win_rate", "profit_factor", "n_trades"}
+    assert keys.issubset(app.backtest_signal(result, cost_bps=0).keys())
+    rets = [app.backtest_signal(result, cost_bps=c)["strategy_total_return"]
+            for c in (0, 5, 25)]
+    assert rets[0] >= rets[1] >= rets[2], rets
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
