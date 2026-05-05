@@ -504,6 +504,34 @@ with tab_predict:
             use_container_width=False,
         )
 
+        contributions = result.get("feature_contributions") or {}
+        if contributions:
+            with st.expander("Why this prediction? (top feature contributions)"):
+                agg: dict[str, float] = {}
+                for model_contribs in contributions.values():
+                    for feat, val in model_contribs.items():
+                        agg[feat] = agg.get(feat, 0.0) + float(val) / len(contributions)
+                contrib_series = pd.Series(agg).sort_values(key=lambda s: s.abs(), ascending=False)
+                top = contrib_series.head(10).iloc[::-1]  # smallest at top of horizontal bar
+                fig_c = go.Figure(go.Bar(
+                    x=top.values, y=top.index,
+                    orientation="h",
+                    marker_color=["#2ecc71" if v >= 0 else "#ff5a5f" for v in top.values],
+                    hovertemplate="%{y}: %{x:+.3f}<extra></extra>",
+                ))
+                fig_c.update_layout(
+                    template="plotly_dark", plot_bgcolor="#0b0d12", paper_bgcolor="#0b0d12",
+                    height=360, margin=dict(l=20, r=20, t=20, b=20),
+                    xaxis=dict(title="Signed contribution (standardized x importance)",
+                               gridcolor="#1a1f2a", color="#8b93a1", zeroline=True,
+                               zerolinecolor="#3d4554"),
+                    yaxis=dict(color="#e6e8eb"),
+                )
+                st.plotly_chart(fig_c, use_container_width=True, config={"displayModeBar": False})
+                st.caption("Green = pushes the predicted return up. Red = pushes it down. "
+                           "Computed as standardized feature value times model importance, "
+                           "averaged across the regressors of the ensemble.")
+
         if result.get("feature_importance"):
             with st.expander("Feature importances"):
                 rows = []

@@ -530,6 +530,24 @@ def train_and_predict(
         if hasattr(m, "feature_importances_"):
             importances[spec.name] = dict(zip(feat_cols, m.feature_importances_.tolist()))
 
+    # Per-prediction contributions for the immediate next day.
+    # Always uses the standardized feature vector so magnitudes are comparable
+    # across features regardless of their natural units (RSI 0-100 vs return 1e-3).
+    # Each model's importance is normalized to sum=1 before multiplying so RF and
+    # LightGBM contribute on the same scale before averaging.
+    contributions = {}
+    last_feat_clipped = np.clip(df[feat_cols].iloc[[-1]].values, feature_min, feature_max)
+    last_standardized = scaler.transform(last_feat_clipped)[0]
+    for spec in specs:
+        m = fitted[spec.name]
+        if not hasattr(m, "feature_importances_"):
+            continue
+        imp = m.feature_importances_.astype(float)
+        total = imp.sum()
+        if total > 0:
+            imp = imp / total
+        contributions[spec.name] = dict(zip(feat_cols, (last_standardized * imp).tolist()))
+
     return {
         "ticker": ticker.upper(),
         "history": raw,
@@ -561,4 +579,5 @@ def train_and_predict(
         "forecast_upper": forecast_upper,
         "per_model_test_returns": per_model_returns,
         "feature_importance": importances,
+        "feature_contributions": contributions,
     }
