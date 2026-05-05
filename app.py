@@ -1,13 +1,34 @@
-"""Streamlit UI: pick a ticker, predict next close, animate the chart."""
+"""Streamlit UI for the stock close predictor.
+
+Two model engines are wired up side-by-side:
+  - "Classique"  -> predict_classic.train_and_predict (original single Random Forest)
+  - "Avance"     -> predict.train_and_predict (ensemble + macro + classifier + conformal)
+
+Tabs: Predict, Backtest, Compare.
+"""
 
 from __future__ import annotations
+
+import hashlib
+import os
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from predict import train_and_predict
+import predict as predict_advanced
+import predict_classic
+
+try:
+    import joblib
+    HAS_JOBLIB = True
+except ImportError:
+    HAS_JOBLIB = False
+
+
+CACHE_DIR = os.path.join(os.path.dirname(__file__), ".prediction_cache")
+os.makedirs(CACHE_DIR, exist_ok=True)
 
 
 st.set_page_config(page_title="Stock Close Predictor", page_icon=":chart_with_upwards_trend:", layout="wide")
@@ -16,16 +37,13 @@ st.markdown(
     """
     <style>
       .stApp { background: #0b0d12; }
-      .block-container { padding-top: 2rem; max-width: 1200px; }
+      .block-container { padding-top: 1.6rem; max-width: 1280px; }
       h1, h2, h3, h4, label, p { color: #e6e8eb !important; }
       div[data-testid="stMetricValue"] { color: #e6e8eb; font-weight: 600; }
-      .hero {
-        text-align: center;
-        padding: 1.2rem 0 0.4rem 0;
-      }
-      .hero-label { font-size: 0.95rem; letter-spacing: 0.12em; text-transform: uppercase; opacity: 0.55; }
-      .hero-price { font-size: 4.2rem; font-weight: 700; line-height: 1.1; margin-top: 0.3rem; }
-      .hero-delta { font-size: 1.4rem; font-weight: 500; opacity: 0.95; }
+      .hero { text-align: center; padding: 0.8rem 0 0.4rem 0; }
+      .hero-label { font-size: 0.9rem; letter-spacing: 0.12em; text-transform: uppercase; opacity: 0.55; }
+      .hero-price { font-size: 4rem; font-weight: 700; line-height: 1.05; margin-top: 0.3rem; }
+      .hero-delta { font-size: 1.3rem; font-weight: 500; opacity: 0.95; }
       .pulse-up { color: #2ecc71; text-shadow: 0 0 18px rgba(46,204,113,0.45); }
       .pulse-down { color: #ff5a5f; text-shadow: 0 0 18px rgba(255,90,95,0.45); }
       .stButton > button {
@@ -34,6 +52,12 @@ st.markdown(
         padding: 0.55rem 1.4rem;
       }
       .stButton > button:hover { border-color: #3d4554; }
+      .stTabs [data-baseweb="tab-list"] { gap: 8px; }
+      .stTabs [data-baseweb="tab"] {
+        background: #11141b; border-radius: 8px 8px 0 0;
+        padding: 0.5rem 1rem; color: #9aa0a6;
+      }
+      .stTabs [aria-selected="true"] { background: #1a1f2a; color: #e6e8eb; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -41,108 +65,147 @@ st.markdown(
 
 
 PRESETS = ["AAPL", "GOOGL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "AMD", "NFLX", "SPY"]
+ENGINES = {
+    "Classique (Random Forest seul)": predict_classic,
+    "Avance (Ensemble + macro + classifier)": predict_advanced,
+}
 
 
-st.markdown("# :chart_with_upwards_trend: Stock Close Predictor")
-st.caption("Random Forest on technical features. Educational use only — not financial advice.")
+# ---------------------------------------------------------------------------
+# Caching
+# ---------------------------------------------------------------------------
 
-c1, c2, c3 = st.columns([2, 1, 1])
-with c1:
-    choice = st.selectbox("Company", PRESETS + ["Other..."], index=1)
-    if choice == "Other...":
-        ticker = st.text_input("Ticker symbol", value="").strip().upper()
-    else:
-        ticker = choice
-with c2:
-    period = st.selectbox("History", ["1y", "2y", "5y", "10y"], index=2)
-with c3:
-    st.write("")
-    st.write("")
-    run = st.button(":crystal_ball: Predict", use_container_width=True)
+def _cache_key(engine_label: str, ticker: str, period: str, horizon: int, use_macro: bool) -> str:
+    raw = f"{engine_label}|{ticker.upper()}|{period}|{horizon}|{use_macro}"
+    return hashlib.md5(raw.encode()).hexdigest()
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 30)
-def cached_predict(ticker: str, period: str):
-    return train_and_predict(ticker, period=period)
+def cached_predict(engine_label: str, ticker: str, period: str, horizon: int, use_macro: bool):
+    """Streamlit memory cache + joblib disk cache (if available)."""
+    key = _cache_key(engine_label, ticker, period, horizon, use_macro)
+    disk_path = os.path.join(CACHE_DIR, f"{key}.joblib")
+    if HAS_JOBLIB and os.path.exists(disk_path):
+        try:
+            return joblib.load(disk_path)
+        except Exception:
+            pass
+
+    engine = ENGINES[engine_label]
+    if engine is predict_advanced:
+        result = engine.train_and_predict(ticker, period=period, horizon=horizon, use_macro=use_macro)
+    else:
+        result = engine.train_and_predict(ticker, period=period)
+
+    if HAS_JOBLIB:
+        try:
+            joblib.dump(result, disk_path)
+        except Exception:
+            pass
+    return result
 
 
-def build_animated_figure(result: dict, color: str, fill_rgba: str) -> go.Figure:
+# ---------------------------------------------------------------------------
+# Charts
+# ---------------------------------------------------------------------------
+
+def _ribbon(x, lo, up):
+    return list(x) + list(x)[::-1], list(up) + list(lo)[::-1]
+
+
+def build_animated_line(result: dict, color: str, fill_rgba: str) -> go.Figure:
     history = result["history"]
     test_dates = list(result["test_dates"])
     pred = list(result["pred_prices"])
     lower = list(result["lower_prices"])
     upper = list(result["upper_prices"])
 
-    next_date = result["next_date"]
-    next_price = result["next_price"]
-    next_lower = result["next_lower"]
-    next_upper = result["next_upper"]
+    forecast_dates = list(result.get("forecast_dates") or [result["next_date"]])
+    forecast_prices = list(result.get("forecast_prices") or [result["next_price"]])
+    forecast_lower = list(result.get("forecast_lower") or [result["next_lower"]])
+    forecast_upper = list(result.get("forecast_upper") or [result["next_upper"]])
 
     context_start = test_dates[0] - pd.Timedelta(days=120)
     ctx = history.loc[history.index >= context_start]
-
     actual_x = list(ctx.index)
     actual_y = list(ctx["close"].values)
 
-    full_pred_dates = test_dates + [next_date]
-    full_pred = pred + [next_price]
-    full_lower = lower + [next_lower]
-    full_upper = upper + [next_upper]
+    full_dates = test_dates + forecast_dates
+    full_pred = pred + forecast_prices
+    full_lower = lower + forecast_lower
+    full_upper = upper + forecast_upper
 
-    n = len(full_pred_dates)
+    n = len(full_dates)
     frames = []
     for i in range(2, n + 1):
-        d = full_pred_dates[:i]
+        d = full_dates[:i]
         p = full_pred[:i]
         lo = full_lower[:i]
         up = full_upper[:i]
-        ribbon_x = list(d) + list(d)[::-1]
-        ribbon_y = list(up) + list(lo)[::-1]
-
-        marker_x = [d[-1]]
-        marker_y = [p[-1]]
-
-        frames.append(
-            go.Frame(
-                name=str(i),
-                data=[
-                    go.Scatter(x=actual_x, y=actual_y),
-                    go.Scatter(x=ribbon_x, y=ribbon_y),
-                    go.Scatter(x=d, y=p),
-                    go.Scatter(x=marker_x, y=marker_y),
-                ],
-            )
-        )
+        rx, ry = _ribbon(d, lo, up)
+        frames.append(go.Frame(
+            name=str(i),
+            data=[
+                go.Scatter(x=actual_x, y=actual_y),
+                go.Scatter(x=rx, y=ry),
+                go.Scatter(x=d, y=p),
+                go.Scatter(x=[d[-1]], y=[p[-1]]),
+            ],
+        ))
 
     init = frames[0]
     fig = go.Figure(
         data=[
-            go.Scatter(
-                x=actual_x, y=actual_y, name="Actual",
-                line=dict(color="#9aa0a6", width=2),
-                hovertemplate="%{x|%b %d, %Y}<br>$%{y:.2f}<extra></extra>",
-            ),
-            go.Scatter(
-                x=init.data[1].x, y=init.data[1].y,
-                fill="toself", fillcolor=fill_rgba,
-                line=dict(color="rgba(0,0,0,0)"),
-                name="95% CI", hoverinfo="skip", showlegend=False,
-            ),
-            go.Scatter(
-                x=init.data[2].x, y=init.data[2].y, name="Predicted",
-                line=dict(color=color, width=3),
-                hovertemplate="%{x|%b %d, %Y}<br>$%{y:.2f}<extra></extra>",
-            ),
-            go.Scatter(
-                x=init.data[3].x, y=init.data[3].y, name="",
-                mode="markers",
-                marker=dict(color=color, size=12, line=dict(color="white", width=2)),
-                hoverinfo="skip", showlegend=False,
-            ),
+            go.Scatter(x=actual_x, y=actual_y, name="Actual",
+                       line=dict(color="#9aa0a6", width=2),
+                       hovertemplate="%{x|%b %d, %Y}<br>$%{y:.2f}<extra></extra>"),
+            go.Scatter(x=init.data[1].x, y=init.data[1].y,
+                       fill="toself", fillcolor=fill_rgba,
+                       line=dict(color="rgba(0,0,0,0)"),
+                       name="CI", hoverinfo="skip", showlegend=False),
+            go.Scatter(x=init.data[2].x, y=init.data[2].y, name="Predicted",
+                       line=dict(color=color, width=3),
+                       hovertemplate="%{x|%b %d, %Y}<br>$%{y:.2f}<extra></extra>"),
+            go.Scatter(x=init.data[3].x, y=init.data[3].y, name="",
+                       mode="markers",
+                       marker=dict(color=color, size=12, line=dict(color="white", width=2)),
+                       hoverinfo="skip", showlegend=False),
         ],
         frames=frames,
     )
+    _style_chart(fig)
+    return fig
 
+
+def build_candlestick(result: dict, color: str) -> go.Figure:
+    history = result["history"]
+    test_dates = list(result["test_dates"])
+    context_start = test_dates[0] - pd.Timedelta(days=120)
+    ctx = history.loc[history.index >= context_start]
+
+    forecast_dates = list(result.get("forecast_dates") or [result["next_date"]])
+    forecast_prices = list(result.get("forecast_prices") or [result["next_price"]])
+
+    fig = go.Figure(data=[
+        go.Candlestick(
+            x=ctx.index, open=ctx["open"], high=ctx["high"], low=ctx["low"], close=ctx["close"],
+            name="OHLC", increasing_line_color="#2ecc71", decreasing_line_color="#ff5a5f",
+        ),
+        go.Scatter(
+            x=[ctx.index[-1]] + forecast_dates,
+            y=[float(ctx["close"].iloc[-1])] + forecast_prices,
+            mode="lines+markers", name="Forecast",
+            line=dict(color=color, width=3, dash="dot"),
+            marker=dict(size=8, color=color, line=dict(color="white", width=2)),
+            hovertemplate="%{x|%b %d, %Y}<br>$%{y:.2f}<extra></extra>",
+        ),
+    ])
+    _style_chart(fig)
+    fig.update_layout(xaxis_rangeslider_visible=False)
+    return fig
+
+
+def _style_chart(fig: go.Figure) -> None:
     fig.update_layout(
         template="plotly_dark",
         plot_bgcolor="#0b0d12",
@@ -152,85 +215,254 @@ def build_animated_figure(result: dict, color: str, fill_rgba: str) -> go.Figure
         xaxis=dict(showgrid=False, color="#8b93a1"),
         yaxis=dict(title="Price (USD)", gridcolor="#1a1f2a", color="#8b93a1", zeroline=False),
         legend=dict(orientation="h", y=1.06, x=0, bgcolor="rgba(0,0,0,0)"),
-        updatemenus=[
-            dict(
-                type="buttons", showactive=False, x=0.02, y=1.12, xanchor="left",
-                bgcolor="#11141b", bordercolor="#2a2f3a",
-                buttons=[
-                    dict(
-                        label="Replay",
-                        method="animate",
-                        args=[
-                            None,
-                            dict(
-                                frame=dict(duration=45, redraw=True),
-                                fromcurrent=False,
-                                mode="immediate",
-                                transition=dict(duration=0),
-                            ),
-                        ],
-                    )
-                ],
-            )
-        ],
+        updatemenus=[dict(
+            type="buttons", showactive=False, x=0.02, y=1.12, xanchor="left",
+            bgcolor="#11141b", bordercolor="#2a2f3a",
+            buttons=[dict(label="Replay", method="animate",
+                          args=[None, dict(frame=dict(duration=45, redraw=True),
+                                           fromcurrent=False, mode="immediate",
+                                           transition=dict(duration=0))])],
+        )],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Backtest
+# ---------------------------------------------------------------------------
+
+def backtest_signal(result: dict) -> dict:
+    """Long/flat strategy: be long on day t+1 if model predicts up, else flat. No costs."""
+    actual = np.asarray(result["actual_prices"], dtype=float)
+    pred = np.asarray(result["pred_prices"], dtype=float)
+    history = result["history"]
+    test_dates = list(result["test_dates"])
+    closes_t = history["close"].reindex(test_dates).values.astype(float)
+    realized_returns = (actual / closes_t) - 1
+    pred_returns = (pred / closes_t) - 1
+    signal = (pred_returns > 0).astype(float)
+
+    strat_returns = signal * realized_returns
+    bh_curve = np.cumprod(1 + realized_returns)
+    strat_curve = np.cumprod(1 + strat_returns)
+    return {
+        "dates": test_dates,
+        "buy_hold": bh_curve,
+        "strategy": strat_curve,
+        "n_long_days": int(signal.sum()),
+        "total_days": len(signal),
+        "strategy_total_return": float(strat_curve[-1] - 1),
+        "buy_hold_total_return": float(bh_curve[-1] - 1),
+        "hit_rate": float(((pred_returns > 0) == (realized_returns > 0)).mean()),
+    }
+
+
+def build_backtest_chart(bt: dict) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=bt["dates"], y=(bt["buy_hold"] - 1) * 100,
+                             name="Buy & Hold", line=dict(color="#9aa0a6", width=2)))
+    fig.add_trace(go.Scatter(x=bt["dates"], y=(bt["strategy"] - 1) * 100,
+                             name="Model long/flat", line=dict(color="#2ecc71", width=3)))
+    fig.update_layout(
+        template="plotly_dark", plot_bgcolor="#0b0d12", paper_bgcolor="#0b0d12",
+        height=420, margin=dict(l=20, r=20, t=20, b=20),
+        xaxis=dict(showgrid=False, color="#8b93a1"),
+        yaxis=dict(title="Cumulative return (%)", gridcolor="#1a1f2a", color="#8b93a1"),
+        legend=dict(orientation="h", y=1.05, x=0, bgcolor="rgba(0,0,0,0)"),
     )
     return fig
 
 
-if run:
-    if not ticker:
-        st.warning("Please enter a ticker.")
-        st.stop()
+# ---------------------------------------------------------------------------
+# UI
+# ---------------------------------------------------------------------------
 
-    with st.spinner(f"Training model on {ticker}..."):
-        try:
-            result = cached_predict(ticker, period)
-        except Exception as e:
-            st.error(f"Could not predict for '{ticker}': {e}")
+st.markdown("# :chart_with_upwards_trend: Stock Close Predictor")
+st.caption("Educational. Not financial advice.")
+
+with st.sidebar:
+    st.markdown("### Settings")
+    engine_label = st.radio(
+        "Model engine",
+        list(ENGINES.keys()),
+        index=1,
+        help="Classique = original single Random Forest. Avance = ensemble RF+LightGBM+naive, "
+             "macro features, conformal intervals, direction classifier.",
+    )
+    period = st.selectbox("History window", ["1y", "2y", "5y", "10y"], index=2)
+    horizon = st.slider("Forecast horizon (business days)", 1, 10, 5,
+                        disabled=engine_label.startswith("Classique"),
+                        help="Multi-day recursive forecast (advanced engine only).")
+    use_macro = st.checkbox("Include macro features (VIX, S&P, 10Y)", value=True,
+                            disabled=engine_label.startswith("Classique"))
+    chart_mode = st.radio("Chart style", ["Line + animation", "Candlestick"], index=0)
+
+    if HAS_JOBLIB and st.button("Clear disk cache", use_container_width=True):
+        for f in os.listdir(CACHE_DIR):
+            try:
+                os.remove(os.path.join(CACHE_DIR, f))
+            except OSError:
+                pass
+        st.success("Cache cleared.")
+
+tab_predict, tab_backtest, tab_compare = st.tabs(["Predict", "Backtest", "Compare"])
+
+# ---------------------------------------------------------------------------
+# Predict tab
+# ---------------------------------------------------------------------------
+with tab_predict:
+    c1, c2 = st.columns([3, 1])
+    with c1:
+        choice = st.selectbox("Company", PRESETS + ["Other..."], index=1, key="predict_choice")
+        if choice == "Other...":
+            ticker = st.text_input("Ticker symbol", value="", key="predict_other").strip().upper()
+        else:
+            ticker = choice
+    with c2:
+        st.write("")
+        st.write("")
+        run = st.button(":crystal_ball: Predict", use_container_width=True, key="predict_btn")
+
+    if run:
+        if not ticker:
+            st.warning("Please enter a ticker.")
             st.stop()
+        with st.spinner(f"[{engine_label}] Training on {ticker}..."):
+            try:
+                result = cached_predict(engine_label, ticker, period, horizon, use_macro)
+            except Exception as e:
+                st.error(f"Could not predict for '{ticker}': {e}")
+                st.stop()
+        st.session_state["last_result"] = result
+        st.session_state["last_engine"] = engine_label
 
-    last_close = result["last_close"]
-    next_price = result["next_price"]
-    going_up = next_price >= last_close
-    color = "#2ecc71" if going_up else "#ff5a5f"
-    fill_rgba = "rgba(46,204,113,0.15)" if going_up else "rgba(255,90,95,0.15)"
-    arrow = "&#9650;" if going_up else "&#9660;"
-    pct = (next_price - last_close) / last_close * 100
-    pulse_class = "pulse-up" if going_up else "pulse-down"
+    result = st.session_state.get("last_result")
+    if result:
+        last_close = result["last_close"]
+        next_price = result["next_price"]
+        going_up = next_price >= last_close
+        color = "#2ecc71" if going_up else "#ff5a5f"
+        fill_rgba = "rgba(46,204,113,0.15)" if going_up else "rgba(255,90,95,0.15)"
+        arrow = "&#9650;" if going_up else "&#9660;"
+        pct = (next_price - last_close) / last_close * 100
+        pulse_class = "pulse-up" if going_up else "pulse-down"
+        proba_up = result.get("next_proba_up", 0.5) * 100
 
-    st.markdown(
-        f"""
-        <div class="hero">
-          <div class="hero-label">{result['ticker']} &middot; predicted next close
-              ({result['next_date'].strftime('%b %d, %Y')})</div>
-          <div class="hero-price {pulse_class}">{arrow} ${next_price:,.2f}</div>
-          <div class="hero-delta {pulse_class}">{pct:+.2f}% &nbsp;vs last close ${last_close:,.2f}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+        forecast_dates = result.get("forecast_dates") or [result["next_date"]]
+        last_forecast_date = forecast_dates[-1]
 
-    fig = build_animated_figure(result, color, fill_rgba)
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+        st.markdown(
+            f"""
+            <div class="hero">
+              <div class="hero-label">{result['ticker']} &middot; predicted close
+                  ({result['next_date'].strftime('%b %d')} ... {last_forecast_date.strftime('%b %d, %Y')})</div>
+              <div class="hero-price {pulse_class}">{arrow} ${next_price:,.2f}</div>
+              <div class="hero-delta {pulse_class}">{pct:+.2f}% &nbsp;vs ${last_close:,.2f}
+                  &nbsp;&middot;&nbsp; P(up) = {proba_up:.0f}%</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-    m = result["metrics"]
-    k1, k2, k3 = st.columns(3)
-    k1.metric("MAE (test)", f"${m['mae']:.2f}")
-    k2.metric("RMSE (test)", f"${m['rmse']:.2f}")
-    k3.metric("R² (test)", f"{m['r2']:.3f}")
+        if chart_mode.startswith("Candlestick"):
+            fig = build_candlestick(result, color)
+        else:
+            fig = build_animated_line(result, color, fill_rgba)
+        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
-    st.markdown(
-        "<div style='opacity:0.55; font-size:0.85rem; margin-top:1rem;'>"
-        "The shaded ribbon is a 95% interval from disagreement across the forest's trees. "
-        "Markets are noisy — treat the prediction as a directional hint, nothing more."
-        "</div>",
-        unsafe_allow_html=True,
-    )
-else:
-    st.markdown(
-        "<div style='opacity:0.55; padding:2rem 0;'>"
-        "Pick a ticker and hit <b>Predict</b>. The chart animates the model's "
-        "out-of-sample predictions, then reveals tomorrow's forecast — green if higher, red if lower."
-        "</div>",
-        unsafe_allow_html=True,
-    )
+        m = result["metrics"]
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("MAE (test)", f"${m['mae']:.2f}")
+        k2.metric("RMSE (test)", f"${m['rmse']:.2f}")
+        k3.metric("R^2 (test)", f"{m['r2']:.3f}")
+        k4.metric("Direction acc.", f"{m.get('direction_accuracy', 0)*100:.1f}%")
+
+        if result.get("feature_importance"):
+            with st.expander("Feature importances"):
+                rows = []
+                for model_name, imps in result["feature_importance"].items():
+                    for f, v in imps.items():
+                        rows.append({"model": model_name, "feature": f, "importance": v})
+                if rows:
+                    imp_df = pd.DataFrame(rows).pivot_table(
+                        index="feature", columns="model", values="importance", fill_value=0,
+                    ).sort_values(by=list({r["model"] for r in rows})[0], ascending=False)
+                    st.dataframe(imp_df, use_container_width=True)
+
+# ---------------------------------------------------------------------------
+# Backtest tab
+# ---------------------------------------------------------------------------
+with tab_backtest:
+    result = st.session_state.get("last_result")
+    if not result:
+        st.info("Run a prediction first to see the backtest.")
+    else:
+        bt = backtest_signal(result)
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Strategy return", f"{bt['strategy_total_return']*100:+.2f}%")
+        c2.metric("Buy & hold", f"{bt['buy_hold_total_return']*100:+.2f}%")
+        c3.metric("Hit rate", f"{bt['hit_rate']*100:.1f}%")
+        c4.metric("Days long", f"{bt['n_long_days']}/{bt['total_days']}")
+        st.plotly_chart(build_backtest_chart(bt), use_container_width=True,
+                        config={"displayModeBar": False})
+        st.caption("Long/flat strategy: long on day t+1 when model predicts an up move. "
+                   "No transaction costs, no slippage. Out-of-sample test window only.")
+
+# ---------------------------------------------------------------------------
+# Compare tab
+# ---------------------------------------------------------------------------
+with tab_compare:
+    st.markdown("Pick a few tickers to compare next-day forecasts side by side.")
+    cmp_tickers = st.multiselect("Tickers", PRESETS, default=["AAPL", "GOOGL", "NVDA"])
+    cmp_run = st.button("Compare", key="cmp_btn")
+    if cmp_run and cmp_tickers:
+        rows = []
+        progress = st.progress(0.0)
+        for i, t in enumerate(cmp_tickers):
+            try:
+                r = cached_predict(engine_label, t, period, horizon, use_macro)
+                rows.append({
+                    "Ticker": r["ticker"],
+                    "Last close": r["last_close"],
+                    "Next predicted": r["next_price"],
+                    "Change %": (r["next_price"] - r["last_close"]) / r["last_close"] * 100,
+                    "P(up)": r.get("next_proba_up", 0.5) * 100,
+                    "MAE": r["metrics"]["mae"],
+                    "Dir acc": r["metrics"].get("direction_accuracy", 0) * 100,
+                })
+            except Exception as e:
+                rows.append({"Ticker": t.upper(), "Last close": None, "Next predicted": None,
+                             "Change %": None, "P(up)": None, "MAE": None, "Dir acc": None,
+                             "error": str(e)})
+            progress.progress((i + 1) / len(cmp_tickers))
+        progress.empty()
+
+        df_cmp = pd.DataFrame(rows)
+
+        def _style(v):
+            if isinstance(v, (int, float)) and not pd.isna(v):
+                return f"color: {'#2ecc71' if v >= 0 else '#ff5a5f'}; font-weight:600;"
+            return ""
+
+        st.dataframe(
+            df_cmp.style.applymap(_style, subset=["Change %"]).format({
+                "Last close": "${:,.2f}", "Next predicted": "${:,.2f}",
+                "Change %": "{:+.2f}%", "P(up)": "{:.0f}%",
+                "MAE": "${:.2f}", "Dir acc": "{:.1f}%",
+            }),
+            use_container_width=True,
+        )
+
+        # Bar chart of expected % moves
+        plot_df = df_cmp.dropna(subset=["Change %"])
+        if not plot_df.empty:
+            fig = go.Figure(go.Bar(
+                x=plot_df["Ticker"], y=plot_df["Change %"],
+                marker_color=["#2ecc71" if v >= 0 else "#ff5a5f" for v in plot_df["Change %"]],
+                hovertemplate="%{x}: %{y:+.2f}%<extra></extra>",
+            ))
+            fig.update_layout(
+                template="plotly_dark", plot_bgcolor="#0b0d12", paper_bgcolor="#0b0d12",
+                height=360, margin=dict(l=20, r=20, t=20, b=20),
+                yaxis=dict(title="Predicted next-day move (%)", gridcolor="#1a1f2a"),
+            )
+            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
