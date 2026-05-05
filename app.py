@@ -64,7 +64,14 @@ st.markdown(
 )
 
 
-PRESETS = ["AAPL", "GOOGL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "AMD", "NFLX", "SPY"]
+PRESET_GROUPS = {
+    "US large caps": ["AAPL", "GOOGL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "AMD", "NFLX"],
+    "Indices & ETFs": ["SPY", "QQQ", "DIA", "IWM", "VTI", "EEM"],
+    "International": ["BABA", "TM", "ASML", "MC.PA", "AIR.PA", "OR.PA", "SAP", "TSM"],
+    "Crypto": ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD"],
+    "FX": ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "USDCHF=X"],
+}
+PRESETS = [t for group in PRESET_GROUPS.values() for t in group]
 ENGINES = {
     "Classique (Random Forest seul)": predict_classic,
     "Avance (Ensemble + macro + classifier)": predict_advanced,
@@ -230,8 +237,31 @@ def _style_chart(fig: go.Figure) -> None:
 # Backtest
 # ---------------------------------------------------------------------------
 
-def backtest_signal(result: dict) -> dict:
-    """Long/flat strategy: be long on day t+1 if model predicts up, else flat. No costs."""
+def _max_drawdown(curve: np.ndarray) -> float:
+    """Worst peak-to-trough decline of an equity curve. Returns a negative number."""
+    if len(curve) == 0:
+        return 0.0
+    running_max = np.maximum.accumulate(curve)
+    drawdowns = curve / running_max - 1
+    return float(drawdowns.min())
+
+
+def _sharpe(returns: np.ndarray, periods_per_year: int = 252) -> float:
+    """Annualized Sharpe with rf=0. Returns 0 if std is zero."""
+    if len(returns) < 2:
+        return 0.0
+    std = returns.std(ddof=1)
+    if std == 0:
+        return 0.0
+    return float(returns.mean() / std * np.sqrt(periods_per_year))
+
+
+def backtest_signal(result: dict, cost_bps: float = 0.0) -> dict:
+    """Long/flat strategy: long on day t+1 when the model predicts an up move.
+
+    cost_bps applies on every position change (entry and exit), expressed in basis
+    points of notional (e.g. 10 = 0.10%).
+    """
     actual = np.asarray(result["actual_prices"], dtype=float)
     pred = np.asarray(result["pred_prices"], dtype=float)
     history = result["history"]
@@ -241,18 +271,37 @@ def backtest_signal(result: dict) -> dict:
     pred_returns = (pred / closes_t) - 1
     signal = (pred_returns > 0).astype(float)
 
-    strat_returns = signal * realized_returns
+    # Cost is paid whenever the position changes between consecutive days.
+    position_changes = np.abs(np.diff(np.concatenate([[0.0], signal])))
+    costs = position_changes * (cost_bps / 10_000.0)
+
+    strat_returns = signal * realized_returns - costs
     bh_curve = np.cumprod(1 + realized_returns)
     strat_curve = np.cumprod(1 + strat_returns)
+
+    long_days_returns = strat_returns[signal == 1]
+    wins = long_days_returns[long_days_returns > 0]
+    losses = long_days_returns[long_days_returns < 0]
+    win_rate = float(len(wins) / len(long_days_returns)) if len(long_days_returns) else 0.0
+    profit_factor = float(wins.sum() / -losses.sum()) if len(losses) and losses.sum() < 0 else float("inf")
+
     return {
         "dates": test_dates,
         "buy_hold": bh_curve,
         "strategy": strat_curve,
+        "strategy_returns": strat_returns,
         "n_long_days": int(signal.sum()),
+        "n_trades": int(position_changes.sum()),
         "total_days": len(signal),
         "strategy_total_return": float(strat_curve[-1] - 1),
         "buy_hold_total_return": float(bh_curve[-1] - 1),
         "hit_rate": float(((pred_returns > 0) == (realized_returns > 0)).mean()),
+        "win_rate": win_rate,
+        "profit_factor": profit_factor,
+        "sharpe": _sharpe(strat_returns),
+        "max_drawdown": _max_drawdown(strat_curve),
+        "buy_hold_max_drawdown": _max_drawdown(bh_curve),
+        "cost_bps": cost_bps,
     }
 
 
@@ -310,14 +359,17 @@ tab_predict, tab_backtest, tab_compare = st.tabs(["Predict", "Backtest", "Compar
 # Predict tab
 # ---------------------------------------------------------------------------
 with tab_predict:
-    c1, c2 = st.columns([3, 1])
+    c1, c2, c3 = st.columns([2, 2, 1])
     with c1:
-        choice = st.selectbox("Company", PRESETS + ["Other..."], index=1, key="predict_choice")
-        if choice == "Other...":
-            ticker = st.text_input("Ticker symbol", value="", key="predict_other").strip().upper()
-        else:
-            ticker = choice
+        group = st.selectbox("Asset class", list(PRESET_GROUPS.keys()) + ["Other..."],
+                             index=0, key="predict_group")
     with c2:
+        if group == "Other...":
+            ticker = st.text_input("Ticker symbol (Yahoo Finance format)",
+                                   value="", key="predict_other").strip().upper()
+        else:
+            ticker = st.selectbox("Ticker", PRESET_GROUPS[group], key="predict_ticker")
+    with c3:
         st.write("")
         st.write("")
         run = st.button(":crystal_ball: Predict", use_container_width=True, key="predict_btn")
@@ -376,6 +428,32 @@ with tab_predict:
         k3.metric("R^2 (test)", f"{m['r2']:.3f}")
         k4.metric("Direction acc.", f"{m.get('direction_accuracy', 0)*100:.1f}%")
 
+        # CSV export: out-of-sample predictions and the forward forecast.
+        export_test = pd.DataFrame({
+            "date": result["test_dates"],
+            "actual_close": result["actual_prices"],
+            "predicted_close": result["pred_prices"],
+            "lower_95": result["lower_prices"],
+            "upper_95": result["upper_prices"],
+            "kind": "test",
+        })
+        export_forecast = pd.DataFrame({
+            "date": result.get("forecast_dates") or [result["next_date"]],
+            "actual_close": np.nan,
+            "predicted_close": result.get("forecast_prices") or [result["next_price"]],
+            "lower_95": result.get("forecast_lower") or [result["next_lower"]],
+            "upper_95": result.get("forecast_upper") or [result["next_upper"]],
+            "kind": "forecast",
+        })
+        export_df = pd.concat([export_test, export_forecast], ignore_index=True)
+        st.download_button(
+            ":arrow_down: Download predictions (CSV)",
+            data=export_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"{result['ticker']}_predictions.csv",
+            mime="text/csv",
+            use_container_width=False,
+        )
+
         if result.get("feature_importance"):
             with st.expander("Feature importances"):
                 rows = []
@@ -396,23 +474,48 @@ with tab_backtest:
     if not result:
         st.info("Run a prediction first to see the backtest.")
     else:
-        bt = backtest_signal(result)
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Strategy return", f"{bt['strategy_total_return']*100:+.2f}%")
-        c2.metric("Buy & hold", f"{bt['buy_hold_total_return']*100:+.2f}%")
-        c3.metric("Hit rate", f"{bt['hit_rate']*100:.1f}%")
-        c4.metric("Days long", f"{bt['n_long_days']}/{bt['total_days']}")
+        cost_bps = st.slider(
+            "Transaction cost (basis points per side)",
+            min_value=0, max_value=50, value=5, step=1,
+            help="Charged on every position change. 5 bps ~ 0.05% per entry/exit.",
+        )
+        bt = backtest_signal(result, cost_bps=float(cost_bps))
+
+        r1c1, r1c2, r1c3, r1c4 = st.columns(4)
+        r1c1.metric("Strategy return", f"{bt['strategy_total_return']*100:+.2f}%",
+                    delta=f"vs B&H {(bt['strategy_total_return']-bt['buy_hold_total_return'])*100:+.2f}%")
+        r1c2.metric("Buy & hold", f"{bt['buy_hold_total_return']*100:+.2f}%")
+        r1c3.metric("Sharpe (ann.)", f"{bt['sharpe']:.2f}")
+        r1c4.metric("Max drawdown", f"{bt['max_drawdown']*100:.1f}%",
+                    delta=f"B&H {bt['buy_hold_max_drawdown']*100:.1f}%", delta_color="inverse")
+
+        r2c1, r2c2, r2c3, r2c4 = st.columns(4)
+        r2c1.metric("Hit rate", f"{bt['hit_rate']*100:.1f}%")
+        r2c2.metric("Win rate (long days)", f"{bt['win_rate']*100:.1f}%")
+        pf = bt["profit_factor"]
+        r2c3.metric("Profit factor", "inf" if pf == float("inf") else f"{pf:.2f}")
+        r2c4.metric("Trades", f"{bt['n_trades']}",
+                    delta=f"{bt['n_long_days']}/{bt['total_days']} days long")
+
         st.plotly_chart(build_backtest_chart(bt), use_container_width=True,
                         config={"displayModeBar": False})
-        st.caption("Long/flat strategy: long on day t+1 when model predicts an up move. "
-                   "No transaction costs, no slippage. Out-of-sample test window only.")
+        st.caption(
+            f"Long/flat strategy: long on day t+1 when model predicts up. "
+            f"Costs: {cost_bps} bps per position change. No slippage modeled. "
+            "Out-of-sample test window only."
+        )
 
 # ---------------------------------------------------------------------------
 # Compare tab
 # ---------------------------------------------------------------------------
 with tab_compare:
     st.markdown("Pick a few tickers to compare next-day forecasts side by side.")
-    cmp_tickers = st.multiselect("Tickers", PRESETS, default=["AAPL", "GOOGL", "NVDA"])
+    cmp_group = st.selectbox("Asset class", list(PRESET_GROUPS.keys()), index=0, key="cmp_group")
+    cmp_tickers = st.multiselect(
+        "Tickers", PRESET_GROUPS[cmp_group],
+        default=PRESET_GROUPS[cmp_group][:3],
+        key="cmp_tickers_select",
+    )
     cmp_run = st.button("Compare", key="cmp_btn")
     if cmp_run and cmp_tickers:
         rows = []
